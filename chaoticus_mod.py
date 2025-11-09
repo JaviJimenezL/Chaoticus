@@ -1,0 +1,2397 @@
+"""
+Authors:
+    - Javier Jiménez-López, Universidad Complutense de Madrid
+    - José B. Sáez Landete, Universidad de Alcalá
+    - Víctor J. García Garrido, Universidad de Alcalá
+"""
+
+"""
+Import the necessary external libraries
+"""
+try 
+    import numpy as np
+    import traceback
+    import collections.abc
+    import numbers
+    import warnings 
+except ImportError:
+    print("Error: Could not import necessary libraries.")
+    sys.exit(1)
+
+try:
+    from numba import cuda, float64
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    print("Warning: Numba not found.")
+    _NUMBA_AVAILABLE = False
+    cuda = None
+    float64 = None
+
+import math
+
+try:
+    import cupy as cp
+    _CUPY_AVAILABLE = True
+except ImportError:
+    print("Warning: CuPy not found.")
+    _CUPY_AVAILABLE = False
+    cp = None
+
+
+########################################################################################################
+########################################################################################################
+############################################ FUNCTIONS #################################################
+########################################################################################################
+########################################################################################################
+
+
+# =========================================
+# Neighbor Generation Function
+# =========================================
+def neigh_gen(ic: np.ndarray, dims_to_perturb: list[int], d: float = 1e-4) -> np.ndarray:
+
+    """
+    Generates neighboring initial conditions by perturbing specified dimensions.
+
+    For each dimension index provided in `dims_to_perturb`, it creates two
+    neighboring initial conditions: one by adding 'd' to that dimension
+    and one by subtracting 'd'.
+
+    Args:
+        ic: The initial condition vector (1D NumPy array). Must contain numeric types.
+        dims_to_perturb: A sequence (list, tuple, etc.) of integer indices
+                         indicating which dimensions of the initial condition
+                         vector to perturb.
+        d: The small perturbation amount. Must be a number (int or float).
+           Defaults to 1e-4.
+
+    Returns:
+        A 2D NumPy array where each row is a neighboring initial condition.
+        The shape will be (2 * len(dims_to_perturb), len(ic)).
+        The dtype will match the dtype of the input 'ic'.
+        Neighbors are ordered in pairs: [ic_dim0_plus, ic_dim0_minus,
+                                       ic_dim1_plus, ic_dim1_minus, ...].
+        Returns an empty array with shape (0, len(ic)) if dims_to_perturb is empty.
+
+    Raises:
+        TypeError: If 'ic' is not a NumPy array.
+        ValueError: If 'ic' is not a 1D NumPy array.
+        ValueError: If 'ic' does not have a numeric dtype.
+        TypeError: If 'dims_to_perturb' is not a sequence (like list or tuple).
+        TypeError: If any element in 'dims_to_perturb' is not an integer.
+        IndexError: If any index in 'dims_to_perturb' is out of bounds for 'ic'.
+        TypeError: If 'd' is not a number (int or float).
+    """
+
+    if not isinstance(ic, np.ndarray):
+
+        raise TypeError(f"Input 'ic' must be a NumPy array, but got type {type(ic).__name__}.")
+
+    if ic.ndim != 1:
+
+        raise ValueError(f"Input 'ic' must be a 1D NumPy array, but got shape {ic.shape}.")
+
+    if not np.issubdtype(ic.dtype, np.number):
+
+        raise ValueError(f"Input 'ic' must have a numeric dtype, but got {ic.dtype}.")
+
+    num_dims = len(ic)
+
+    if not isinstance(d, (int, float)):
+        raise TypeError(f"Perturbation amount 'd' must be a number (int or float), "
+                        f"but got type {type(d).__name__}.")
+
+    d_float = float(d)
+
+    if not isinstance(dims_to_perturb, collections.abc.Sequence):
+
+         raise TypeError(f"'dims_to_perturb' must be a sequence (e.g., list, tuple), "
+                         f"but got type {type(dims_to_perturb).__name__}.")
+
+    invalid_indices = []
+    non_int_indices = []
+
+    for i in dims_to_perturb:
+
+        if not isinstance(i, int) or isinstance(i, bool):
+
+            non_int_indices.append(repr(i))
+
+        elif not 0 <= i < num_dims:
+
+            invalid_indices.append(i)
+
+    if non_int_indices:
+
+        raise TypeError(f"All elements in 'dims_to_perturb' must be integers. "
+                        f"Found non-integers: {', '.join(non_int_indices)}")
+
+    if invalid_indices:
+        
+        invalid_indices.sort()
+
+        raise IndexError(f"Dimension indices in 'dims_to_perturb' are out of bounds. "
+                         f"Valid range is [0, {num_dims - 1}]. "
+                         f"Invalid indices found: {invalid_indices}")
+
+    neighbors_array = np.empty((2 * len(dims_to_perturb), num_dims), dtype=ic.dtype)
+    row_index = 0
+
+    for i in dims_to_perturb:
+
+        state_p = ic.copy()
+        state_p[i] += d_float
+        neighbors_array[row_index] = state_p
+
+        state_m = ic.copy()
+        state_m[i] -= d_float
+        neighbors_array[row_index + 1] = state_m
+
+        row_index += 2
+
+    return neighbors_array
+
+# =========================================
+# Random Vector in Hypersphere Function
+# =========================================
+def random_vector_in_hypersphere(dim: int, max_norm: float) -> np.ndarray:
+
+    """
+    Generates a random vector in a hypersphere of a given dimension and maximum norm.
+
+    Args:
+        dim: The dimension of the hypersphere.
+        max_norm: The maximum norm of the vector.
+
+    Returns:
+        The random vector in the hypersphere (1D NumPy array).
+
+    Raises:
+        ValueError: If max_norm is negative.
+    """
+
+    if max_norm < 0:
+
+        raise ValueError("max_norm must be non-negative.")
+
+    if max_norm == 0:
+
+        return np.zeros(dim)
+
+    direction = np.random.randn(dim)
+    direction_norm = np.linalg.norm(direction)
+
+    if direction_norm == 0:
+
+        return random_vector_in_hypersphere(dim, max_norm)
+
+    unit_direction = direction / direction_norm
+    u = np.random.rand()
+    radius = max_norm * (u ** (1.0 / dim))
+    vector = radius * unit_direction
+
+    return vector
+
+# =========================================
+# Perturb Initial Condition Function
+# =========================================
+def perturb_ic(ic: np.ndarray, max_norm: float, dims_to_perturb: list[int] | tuple[int, ...] | None = None) -> np.ndarray:  
+    
+    """
+    Perturbs an initial condition by a random vector in a hypersphere.
+
+    Args:
+        ic: The initial condition vector (1D NumPy array).
+        max_norm: The maximum norm of the vector.
+        dims_to_perturb: A sequence (list, tuple, etc.) of integer indices
+                         indicating which dimensions of the initial condition
+                         vector to perturb.
+
+    Returns:
+        The perturbed initial condition vector (1D NumPy array).
+
+    Raises:
+        ValueError: If max_norm is negative.
+    """
+
+    if max_norm < 0:
+
+        raise ValueError("max_norm must be non-negative.")
+
+    original_dim = len(ic)
+
+    if dims_to_perturb is None:
+
+        dims_to_perturb = list(range(original_dim))
+
+    elif not dims_to_perturb:
+
+        return ic.copy()
+
+    if any(idx < 0 or idx >= original_dim for idx in dims_to_perturb):
+
+         raise IndexError(f"dims_to_perturb contains indices out of bounds for ic of length {original_dim}")
+
+    perturb_dim = len(dims_to_perturb)
+    perturbation_values = random_vector_in_hypersphere(perturb_dim, max_norm)
+    full_perturbation = np.zeros_like(ic, dtype=float)
+    full_perturbation[list(dims_to_perturb)] = perturbation_values
+    neighbor_ic = ic + full_perturbation
+
+    return neighbor_ic
+
+# =========================================
+# Chaos Indicators based on LD Function
+# =========================================
+def chaos_indicators(L: float, L_neighbors: collections.abc.Sequence[float], d: float) -> tuple[float, float, float, float]:
+    
+    """
+    Calculates chaos indicators (D, R, C, S) derived from Lagrangian Descriptors (LDs).
+
+    Assumes L_neighbors contains LD values from pairs of neighboring trajectories,
+    where each pair corresponds to a positive and negative perturbation 'd' along
+    a specific initial condition dimension.
+
+    Args:
+        L: The Lagrangian Descriptor value (a number) from the central trajectory.
+        L_neighbors: A sequence (list, tuple, 1D NumPy array, etc.) containing
+                     the numeric LD values from the neighboring trajectories.
+                     Must contain an even number of elements, ordered in pairs
+                     corresponding to the (+d, -d) perturbations for each
+                     dimension perturbed (e.g., [L_dim0_plus, L_dim0_minus, ...]).
+                     Cannot be empty.
+        d: The perturbation distance (a positive number) used to generate the
+           neighboring initial conditions.
+
+    Returns:
+        A tuple containing the four chaos indicators: (D, R, C, S).
+            - D: Dispersion
+            - R: Renormalization
+            - C: Curvature
+            - S: Smoothness
+        Returns (NaN, NaN, C, S) if L is zero, along with a warning, as D and R
+        involve division by L.
+
+    Raises:
+        TypeError: If L is not a number.
+        TypeError: If d is not a number.
+        ValueError: If d is not positive.
+        TypeError: If L_neighbors is not a sequence or cannot be converted to a
+                   numeric NumPy array.
+        ValueError: If L_neighbors results in a non-1D array after conversion.
+        ValueError: If L_neighbors is empty.
+        ValueError: If L_neighbors has an odd number of elements.
+    """
+    
+    if not isinstance(L, numbers.Number):
+
+        raise TypeError(f"Input 'L' must be a number, but got type {type(L).__name__}.")
+
+    L = float(L)
+
+    if not isinstance(d, numbers.Number):
+
+        raise TypeError(f"Input 'd' must be a number, but got type {type(d).__name__}.")
+
+    if d <= 0:
+
+        raise ValueError(f"Perturbation distance 'd' must be positive, but got {d}.")
+
+    d = float(d)
+
+    if not isinstance(L_neighbors, collections.abc.Sequence):
+
+         raise TypeError(f"'L_neighbors' must be a sequence (e.g., list, tuple), "
+                         f"but got type {type(L_neighbors).__name__}.")
+
+    try:
+
+        L_neighbors_arr = np.asarray(L_neighbors, dtype=float)
+
+    except (ValueError, TypeError) as e:
+
+        raise TypeError(f"Elements in 'L_neighbors' must be numeric and convertible "
+                        f"to a NumPy array. Conversion failed: {e}")
+
+    if L_neighbors_arr.ndim != 1:
+
+        raise ValueError(f"'L_neighbors' must represent a 1D sequence, but resulted "
+                         f"in array with shape {L_neighbors_arr.shape} after conversion.")
+
+    if L_neighbors_arr.size == 0:
+
+         raise ValueError("'L_neighbors' cannot be empty.")
+
+    if L_neighbors_arr.size % 2 != 0:
+
+        raise ValueError(f"'L_neighbors' must have an even number of elements "
+                         f"(pairs of neighbors). Got size {L_neighbors_arr.size}.")
+
+    n = L_neighbors_arr.size // 2
+
+    L1 = L_neighbors_arr[0::2]  
+    L2 = L_neighbors_arr[1::2]  
+
+    aux_array_D = np.abs(L - L1) + np.abs(L - L2)
+    aux_array_R = L1 + L2
+    aux_array_C = np.abs(L1 - L2) / d
+    aux_array_S = np.abs(L1 - 2 * L + L2) / (d**2)
+
+    sum_aux_D = np.sum(aux_array_D)
+    sum_aux_R = np.sum(aux_array_R)
+    sum_aux_C = np.sum(aux_array_C)
+    sum_aux_S = np.sum(aux_array_S)
+
+    C = sum_aux_C / (2 * n)
+    S = sum_aux_S / n
+
+    if np.isclose(L, 0.0):
+
+        D = np.nan
+        R = np.nan
+        warnings.warn("Input 'L' is close to zero. Indicators D and R involve division by L "
+                      "and are returned as NaN.", RuntimeWarning)
+
+    else:
+
+        D = sum_aux_D / (2 * n * L)
+        R = np.abs(1.0 - sum_aux_R / (2 * n * L))
+
+    return D, R, C, S
+
+# =========================================
+# GALI Calculation Function (using CuPy)
+# =========================================
+def calc_GALI(dev_vectors_2d) -> float:
+
+    """
+    Calculates the Generalized Alignment Index (GALI_k) using CuPy SVD.
+
+    GALI_k measures the volume spanned by k deviation vectors. A value near
+    zero indicates linear dependence (alignment) among the vectors, often
+    associated with regular (non-chaotic) dynamics in that subspace.
+    This function computes the product of the singular values of the matrix
+    formed by the k (unnormalized) deviation vectors provided as its *rows*.
+    This product is proportional to the k-dimensional volume spanned by these
+    vectors in the n-dimensional phase space.
+
+    Requires the CuPy library to be installed and a compatible GPU environment.
+
+    Args:
+        dev_vectors_2d (array-like): A 2D array-like object (e.g., NumPy array,
+                                    CuPy array) where each *row* is a deviation
+                                    vector. The shape should be (k, n), where k
+                                    is the GALI order (number of vectors, M) and n
+                                    is the dimension of the phase space (e.g., 2*N).
+                                    Requires k <= n for a meaningful volume calculation.
+
+    Returns:
+        float: The calculated GALI value (product of singular values), transferred
+               back to the CPU. Returns 1.0 if k=0 (convention), 0.0 if k > n
+               (linearly dependent), or np.nan if an error occurs during calculation.
+
+    Raises:
+        ImportError: If CuPy is required but not installed or cannot be imported.
+        ValueError: If the input is not a 2D array, k > n, or contains non-finite values.
+        cp.cuda.CuPyError: For CuPy specific errors during GPU execution (e.g., SVD failure).
+                           (These are caught internally and NaN is returned, but the error
+                            is printed with traceback for debugging).
+    """
+
+    try:
+
+        if not _CUPY_AVAILABLE:
+
+            raise ImportError("CuPy required for calc_GALI but not available.")
+
+        if not isinstance(dev_vectors_2d, (np.ndarray, cp.ndarray)):
+
+             print(f"Warning: Input to calc_GALI was not np/cp array (type: {type(dev_vectors_2d)}). Converting.")
+             dev_vectors_2d = np.asarray(dev_vectors_2d, dtype=np.float64)
+
+        if not np.all(np.isfinite(dev_vectors_2d)):
+
+            raise ValueError("Input matrix contains non-finite values (NaN or Inf)")
+
+        A_cupy = cp.asarray(dev_vectors_2d)
+
+        if A_cupy.ndim != 2: 
+
+            raise ValueError(f"Input must be 2D, got ndim={A_cupy.ndim}")
+            
+        k, n = A_cupy.shape
+
+        if k == 0: 
+            
+            return np.nan
+        
+        if k > n: 
+            
+            return 0.0
+
+        s = cp.linalg.svd(A_cupy, full_matrices=False, compute_uv=False)
+
+        gali_val_cp = cp.prod(s)
+        gali_val_float = gali_val_cp.get()
+
+        if not np.isfinite(gali_val_float):
+
+            print(f"Warning: GALI calc resulted in non-finite value ({gali_val_float}). Shape {k}x{n}.")
+            return np.nan
+
+        return float(gali_val_float)
+    
+    except ImportError as e:
+
+        print(f"\n--- IMPORT ERROR inside calc_GALI ---")
+        print(f" {e}")
+        print(" Ensure CuPy is installed correctly in the environment.")
+        print(f"-----------------------------------\n")
+        raise
+
+    except Exception as e:
+
+        print(f"\n--- ERROR inside calc_GALI ---")
+        print(f" Exception Type: {type(e)}")
+        print(f" Exception Args: {e.args}")
+        print("\n --- Traceback ---")
+        traceback.print_exc()
+        print(f"--------------------\n")
+        return np.nan
+
+# =========================================
+# SALI Calculation Function
+# =========================================
+def calc_SALI(v1: np.ndarray, v2: np.ndarray) -> float:
+
+    """
+    Calculates the standard Smaller Alignment Index (SALI) for two vectors.
+
+    SALI = min(||v1_hat + v2_hat||, ||v1_hat - v2_hat||), where v_hat are
+    normalized vectors. 
+
+    Args:
+        v1: The first deviation vector (1D array-like, numeric).
+        v2: The second deviation vector (1D array-like, numeric).
+
+    Returns:
+        float: The standard SALI value.
+               Returns np.nan if either input vector has a norm very close to zero
+               (below internal tolerance `_SALI_ZERO_TOLERANCE`), as SALI is
+               undefined or trivially zero in this case.
+
+    Raises:
+        TypeError: If inputs `v1` or `v2` cannot be converted to numeric
+                   NumPy arrays.
+        ValueError: If input vectors do not have the same shape.
+        ValueError: If input vectors are not 1D.
+    """
+
+    try:
+
+        v1_arr = np.asarray(v1, dtype=np.float64)
+        v2_arr = np.asarray(v2, dtype=np.float64)
+
+    except (ValueError, TypeError) as e:
+
+        raise TypeError(f"Input vectors v1 and v2 must be array-like and contain numeric types. "
+                        f"Conversion failed: {e}")
+
+    if v1_arr.shape != v2_arr.shape:
+
+        raise ValueError(f"Input vectors must have the same shape, but got "
+                         f"{v1_arr.shape} and {v2_arr.shape}.")
+
+    if v1_arr.ndim != 1:
+
+        raise ValueError(f"Input vectors must be 1D, but got ndim={v1_arr.ndim}.")
+
+    norm_v1 = np.linalg.norm(v1_arr)
+    norm_v2 = np.linalg.norm(v2_arr)
+
+    _SALI_ZERO_TOLERANCE = 1e-15
+
+    if norm_v1 < _SALI_ZERO_TOLERANCE or norm_v2 < _SALI_ZERO_TOLERANCE:
+
+        warnings.warn(f"Input vector norm near zero ({norm_v1:.2e}, {norm_v2:.2e}). Returning SALI = 0.0", RuntimeWarning)
+        return np.nan
+
+    v1_hat = v1_arr / norm_v1
+    v2_hat = v2_arr / norm_v2
+
+    norm_sum = np.linalg.norm(v1_hat + v2_hat)
+    norm_diff = np.linalg.norm(v1_hat - v2_hat)
+
+    sali_value = min(norm_sum, norm_diff)
+
+    return sali_value
+
+# =========================================
+# Modified Gram-Schmidt QR Decomposition
+# =========================================
+@cuda.jit(device=True)
+def mgs_QR(A, R_diag_out, n_rows, n_cols):
+
+    """
+    Performs Modified Gram-Schmidt QR decomposition in-place on matrix A.
+    A is overwritten with Q. Diagonal elements of R are stored in R_diag_out.
+
+    Args:
+        A (cuda.local.array(ndim=2)): Input matrix (n_rows x n_cols) with vectors as columns.
+                                      Modified in-place to become Q.
+        R_diag_out (cuda.local.array(ndim=1)): Output array (n_cols) for diagonal R_jj elements.
+        n_rows (int): Number of rows (dimension of vectors).
+        n_cols (int): Number of columns (number of vectors).
+    """
+
+    for j in range(n_cols):
+        
+        norm_sq_j = 0.0
+
+        for row in range(n_rows):
+
+            val = A[row, j]
+            norm_sq_j += val * val
+
+        R_jj = math.sqrt(norm_sq_j)
+        R_diag_out[j] = R_jj
+
+        inv_R_jj = 1.0 / R_jj
+        for row in range(n_rows):
+            A[row, j] *= inv_R_jj
+
+        for i in range(j + 1, n_cols):
+
+            R_ji = 0.0
+
+            for row in range(n_rows):
+
+                R_ji += A[row, j] * A[row, i]
+
+            for row in range(n_rows):
+
+                A[row, i] -= R_ji * A[row, j]
+
+# =========================================
+# Error Integration Function
+# =========================================
+@cuda.jit(device=True, inline=True)
+def comp_err_int(err_array, n: int):
+
+    """
+    Computes the L2 norm (Euclidean norm) of an error vector.
+
+    Args:
+        err_array: A Numba array (e.g., cuda.local.array) containing the error
+                   vector components.
+        n: The number of elements (dimension) in the error vector.
+
+    Returns:
+        The L2 norm of the error vector (float64).
+    """
+
+    accum = 0.0
+
+    for i in range(n):
+
+        accum += err_array[i] * err_array[i]
+
+    return math.sqrt(accum)
+
+# =========================================
+# Solver Kernel Factory Function (Fixed Step)
+# =========================================
+def create_solver_kernel(ode_func, num_vars: int):
+
+    """
+    Factory function that creates a Numba CUDA kernel for a fixed-step
+    8th order Dormand-Prince integrator (DP8).
+
+    Args:
+        ode_func: A Numba CUDA *device function* representing the system
+                  of Ordinary Differential Equations (ODEs). It must have
+                  the signature: `ode_func(t, Y, dYdt, params)`, where:
+                    - t: current time (float)
+                    - Y: current state vector (1D Numba array)
+                    - dYdt: output array to store derivatives (1D Numba array)
+                    - params: a tuple containing any necessary parameters
+                              for the ODE system.
+        num_vars: The number of variables (dimension) in the ODE system.
+                  This must match the length of Y and dYdt used by ode_func.
+
+    Returns:
+        A Numba CUDA kernel function specialized for the given ode_func
+        and num_vars. The kernel has the signature:
+        `kernel(Y0, t0, dt, params, Y_out, steps)`
+          - Y0: GPU array of initial conditions (num_ics, num_vars).
+          - t0: Initial time (float).
+          - dt: Fixed time step (float).
+          - params: Tuple of parameters to pass to ode_func.
+          - Y_out: GPU array to store final states (num_ics, num_vars).
+          - steps: Number of integration steps (int).
+    """
+
+    _NUM_VARS = num_vars
+
+    @cuda.jit
+    def solver_fix_step(Y0, t0, dt, params, Y_out, steps):
+
+        """
+        CUDA kernel for integration with a 8th order Dormand-Prince
+        fixed step method. This kernel is generated by create_solver_kernel.
+        (Internal Numba JIT function)
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        Y      = cuda.local.array(_NUM_VARS, float64)
+        dYdt   = cuda.local.array(_NUM_VARS, float64)
+        k1     = cuda.local.array(_NUM_VARS, float64)
+        k2     = cuda.local.array(_NUM_VARS, float64)
+        k3     = cuda.local.array(_NUM_VARS, float64)
+        k4     = cuda.local.array(_NUM_VARS, float64)
+        k5     = cuda.local.array(_NUM_VARS, float64)
+        k6     = cuda.local.array(_NUM_VARS, float64)
+        k7     = cuda.local.array(_NUM_VARS, float64)
+        k8     = cuda.local.array(_NUM_VARS, float64)
+        k9     = cuda.local.array(_NUM_VARS, float64)
+        k10    = cuda.local.array(_NUM_VARS, float64)
+        k11    = cuda.local.array(_NUM_VARS, float64)
+        k12    = cuda.local.array(_NUM_VARS, float64)
+        k13    = cuda.local.array(_NUM_VARS, float64)
+        Y_temp = cuda.local.array(_NUM_VARS, float64)
+
+        for i in range(_NUM_VARS):
+
+            Y[i] = Y0[idx, i]
+
+        c2 = 1.0 / 18.0; c3 = 1.0 / 12.0; c4 = 1.0 / 8.0; c5 = 5.0 / 16.0
+        c6 = 3.0 / 8.0; c7 = 59.0 / 400.0; c8 = 93.0 / 200.0
+        c9 = 5490023248.0 / 9719169821.0; c10 = 13.0 / 20.0
+        c11 = 1201146811.0 / 1299019798.0; c12 = 1.0; c13 = 1.0
+        b1 = 14005451.0 / 335480064.0; b6 = -59238493.0 / 1068277825.0
+        b7 = 181606767.0 / 758867731.0; b8 = 561292985.0 / 797845732.0
+        b9 = -1041891430.0 / 1371343529.0; b10 = 760417239.0 / 1151165299.0
+        b11 = 118820643.0 / 751138087.0; b12 = -528747749.0 / 2220607170.0
+        b13 = 1.0 / 4.0
+
+        t = t0
+
+        for step_i in range(steps):
+
+            # --- Stage 1 ---
+            ode_func(t, Y, dYdt, params)
+            for i in range(_NUM_VARS): k1[i] = dt * dYdt[i]
+
+            # --- Stage 2 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0 / 18.0) * k1[i]
+            ode_func(t + c2 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k2[i] = dt * dYdt[i]
+
+            # --- Stage 3 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0 / 48.0) * k1[i] + (1.0 / 16.0) * k2[i]
+            ode_func(t + c3 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k3[i] = dt * dYdt[i]
+
+            # --- Stage 4 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0 / 32.0) * k1[i] + (3.0 / 32.0) * k3[i]
+            ode_func(t + c4 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k4[i] = dt * dYdt[i]
+
+            # --- Stage 5 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (5.0 / 16.0) * k1[i] + (-75.0 / 64.0) * k3[i] + (75.0 / 64.0) * k4[i]
+            ode_func(t + c5 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k5[i] = dt * dYdt[i]
+
+            # --- Stage 6 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (3.0 / 80.0) * k1[i] + (3.0 / 16.0) * k4[i] + (3.0 / 20.0) * k5[i]
+            ode_func(t + c6 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k6[i] = dt * dYdt[i]
+
+            # --- Stage 7 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (29443841.0 / 614563906.0) * k1[i] + (77736538.0 / 692538347.0) * k4[i] + (-28693883.0 / 1125000000.0) * k5[i] + (23124283.0 / 1800000000.0) * k6[i]
+            ode_func(t + c7 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k7[i] = dt * dYdt[i]
+
+            # --- Stage 8 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (16016141.0 / 946692911.0) * k1[i] + (61564180.0 / 158732637.0) * k4[i] + (22789713.0 / 633445777.0) * k5[i] + (545815736.0 / 2771057229.0) * k6[i] + (-180193667.0 / 1043307555.0) * k7[i]
+            ode_func(t + c8 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k8[i] = dt * dYdt[i]
+
+            # --- Stage 9 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (39632708.0 / 573591083.0) * k1[i] + (-433636366.0 / 683701615.0) * k4[i] + (-421739975.0 / 2616292301.0) * k5[i] + (100302831.0 / 723423059.0) * k6[i] + (790204164.0 / 839813087.0) * k7[i] + (800635310.0 / 3783071287.0) * k8[i]
+            ode_func(t + c9 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k9[i] = dt * dYdt[i]
+
+            # --- Stage 10 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (246121993.0 / 1340847787.0) * k1[i] + (-37695042795.0 / 15268766246.0) * k4[i] + (-309121744.0 / 1061227803.0) * k5[i] + (-12992083.0 / 490766935.0) * k6[i] + (6005943493.0 / 2108947869.0) * k7[i] + (393006217.0 / 1396673457.0) * k8[i] + (123872331.0 / 1001029789.0) * k9[i]
+            ode_func(t + c10 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k10[i] = dt * dYdt[i]
+
+            # --- Stage 11 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (-1028468189.0 / 846180014.0) * k1[i] + (8478235783.0 / 508512852.0) * k4[i] + (1311729495.0 / 1432422823.0) * k5[i] + (-10304129995.0 / 1701304382.0) * k6[i] + (-48777925059.0 / 3047939560.0) * k7[i] + (15336726248.0 / 1032824649.0) * k8[i] + (-45442868181.0 / 3398467696.0) * k9[i] + (3065993473.0 / 597172653.0) * k10[i]
+            ode_func(t + c11 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k11[i] = dt * dYdt[i]
+
+            # --- Stage 12 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (185892177.0 / 718116043.0) * k1[i] + (-3185094517.0 / 667107341.0) * k4[i] + (-477755414.0 / 1098053517.0) * k5[i] + (-703635378.0 / 230739211.0) * k6[i] + (5731566787.0 / 1027545527.0) * k7[i] + (5232866602.0 / 850066563.0) * k8[i] + (-4093664535.0 / 808688257.0) * k9[i] + (3962137247.0 / 1805957418.0) * k10[i] + (65686358.0 / 487910083.0) * k11[i]
+            ode_func(t + c12 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k12[i] = dt * dYdt[i]
+
+            # --- Stage 13 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (403863854.0 / 491063109.0) * k1[i] + (-5068492393.0 / 434740067.0) * k4[i] + (-411421997.0 / 543043805.0) * k5[i] + (652783627.0 / 914296604.0) * k6[i] + (11173962825.0 / 925320556.0) * k7[i] + (-13158990841.0 / 6184727034.0) * k8[i] + (3936647629.0 / 1978049680.0) * k9[i] + (-160528059.0 / 685178525.0) * k10[i] + (248638103.0 / 1413531060.0) * k11[i]
+            ode_func(t + c13 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k13[i] = dt * dYdt[i]
+
+            for i in range(_NUM_VARS):
+
+                Y[i] += (b1 * k1[i] + b6 * k6[i] + b7 * k7[i] + b8 * k8[i] +
+                         b9 * k9[i] + b10 * k10[i] + b11 * k11[i] + b12 * k12[i] +
+                         b13 * k13[i])
+
+            t += dt
+
+        for i in range(_NUM_VARS):
+
+            Y_out[idx, i] = Y[i]
+
+    return solver_fix_step
+
+# =========================================
+# Solver Kernel Factory Function (Adaptive Step)
+# =========================================
+def create_solver_kernel_adaptive(ode_func, num_vars: int):
+
+    """
+    Factory function that creates a Numba CUDA kernel for an adaptive-step
+    8th order Dormand-Prince integrator (DP8) with a 5th order embedded
+    method for error estimation (DP8(5)).
+
+    Args:
+        ode_func: A Numba CUDA *device function* representing the system
+                  of Ordinary Differential Equations (ODEs). It must have
+                  the signature: `ode_func(t, Y, dYdt, params)`, where:
+                    - t: current time (float)
+                    - Y: current state vector (1D Numba array)
+                    - dYdt: output array to store derivatives (1D Numba array)
+                    - params: a tuple containing any necessary parameters
+                              for the ODE system.
+        num_vars: The number of variables (dimension) in the ODE system.
+                  This must match the length of Y and dYdt used by ode_func.
+
+    Returns:
+        A Numba CUDA kernel function specialized for the given ode_func
+        and num_vars. The kernel has the signature:
+        `kernel(Y0, t0, t_final, params, tol, dt_initial, max_steps, Y_out)`
+          - Y0: GPU array of initial conditions (num_ics, num_vars).
+          - t0: Initial time (float).
+          - t_final: The time to integrate until (float).
+          - params: Tuple of parameters to pass to ode_func.
+          - tol: Absolute error tolerance for step control (float).
+          - dt_initial: Initial guess for the time step (float).
+          - max_steps: Maximum number of adaptive steps allowed (int).
+          - Y_out: GPU array to store final states (num_ics, num_vars).
+                   Note: Contains the state at the *last accepted step*. If
+                   max_steps is reached before t_final, the state will be
+                   at some t < t_final.
+    """
+
+    _NUM_VARS = num_vars
+
+    @cuda.jit
+    def solver_adaptive_step(Y0, t0, t_final, params, tol, dt_initial, max_steps, Y_out):
+
+        """
+        CUDA kernel for adaptive integration with DP8(5).
+        Generated by create_solver_kernel_adaptive.
+        (Internal Numba JIT function)
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        Y      = cuda.local.array(_NUM_VARS, float64)
+        dYdt   = cuda.local.array(_NUM_VARS, float64)
+        k1     = cuda.local.array(_NUM_VARS, float64)
+        k2     = cuda.local.array(_NUM_VARS, float64)
+        k3     = cuda.local.array(_NUM_VARS, float64)
+        k4     = cuda.local.array(_NUM_VARS, float64)
+        k5     = cuda.local.array(_NUM_VARS, float64)
+        k6     = cuda.local.array(_NUM_VARS, float64)
+        k7     = cuda.local.array(_NUM_VARS, float64)
+        k8     = cuda.local.array(_NUM_VARS, float64)
+        k9     = cuda.local.array(_NUM_VARS, float64)
+        k10    = cuda.local.array(_NUM_VARS, float64)
+        k11    = cuda.local.array(_NUM_VARS, float64)
+        k12    = cuda.local.array(_NUM_VARS, float64)
+        k13    = cuda.local.array(_NUM_VARS, float64)
+        Y_temp = cuda.local.array(_NUM_VARS, float64)
+        Y_err  = cuda.local.array(_NUM_VARS, float64)
+
+        for i in range(_NUM_VARS):
+
+            Y[i] = Y0[idx, i]
+
+        c2 = 1.0/18.0; c3 = 1.0/12.0; c4 = 1.0/8.0; c5 = 5.0/16.0
+        c6 = 3.0/8.0; c7 = 59.0/400.0; c8 = 93.0/200.0
+        c9 = 5490023248.0/9719169821.0; c10 = 13.0/20.0
+        c11 = 1201146811.0/1299019798.0; c12 = 1.0; c13 = 1.0
+
+        b1 = 14005451.0/335480064.0; b6 = -59238493.0/1068277825.0
+        b7 = 181606767.0/758867731.0; b8 = 561292985.0/797845732.0
+        b9 = -1041891430.0/1371343529.0; b10 = 760417239.0/1151165299.0
+        b11 = 118820643.0/751138087.0; b12 = -528747749.0/2220607170.0
+        b13 = 1.0/4.0
+
+        bs1  =  13451932.0/455176623.0; bs6 = -808719846.0/976000145.0
+        bs7  =  1757004468.0/5645159321.0; bs8 =  656045339.0/265891186.0
+        bs9  = -3867574721.0/1518517206.0; bs10 = 465885868.0/322736535.0
+        bs11 =  53011238.0/667516719.0; bs12 =  2.0/45.0
+        bs13 =  0.0
+
+        t = t0
+        dt = dt_initial
+        step_count = 0
+        safety = 0.9
+        min_scale = 0.2
+        max_scale = 5.0
+        exponent = 1.0 / 6.0
+        tiny = 1e-30
+
+        while (t < t_final) and (step_count < max_steps):
+
+            if (t + dt > t_final):
+
+                dt = t_final - t
+
+            # --- Stage 1 ---
+            ode_func(t, Y, dYdt, params)
+            for i in range(_NUM_VARS): k1[i] = dt * dYdt[i]
+
+            # --- Stage 2 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/18.0) * k1[i] # Using Y_temp as scratch space
+            ode_func(t + c2 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k2[i] = dt * dYdt[i]
+
+            # --- Stage 3 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/48.0)*k1[i] + (1.0/16.0)*k2[i]
+            ode_func(t + c3 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k3[i] = dt * dYdt[i]
+            
+            # --- Stage 4 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/32.0)*k1[i] + (3.0/32.0)*k3[i]
+            ode_func(t + c4 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k4[i] = dt * dYdt[i]
+
+            # --- Stage 5 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (5.0/16.0)*k1[i] + (-75.0/64.0)*k3[i] + (75.0/64.0)*k4[i]
+            ode_func(t + c5 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k5[i] = dt * dYdt[i]
+
+            # --- Stage 6 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (3.0/80.0)*k1[i] + (3.0/16.0)*k4[i] + (3.0/20.0)*k5[i]
+            ode_func(t + c6 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k6[i] = dt * dYdt[i]
+            # --- Stage 7 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (29443841.0/614563906.0)*k1[i] + (77736538.0/692538347.0)*k4[i] + (-28693883.0/1125000000.0)*k5[i] + (23124283.0/1800000000.0)*k6[i]
+            ode_func(t + c7 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k7[i] = dt * dYdt[i]
+
+            # --- Stage 8 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (16016141.0/946692911.0)*k1[i] + (61564180.0/158732637.0)*k4[i] + (22789713.0/633445777.0)*k5[i] + (545815736.0/2771057229.0)*k6[i] + (-180193667.0/1043307555.0)*k7[i]
+            ode_func(t + c8 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k8[i] = dt * dYdt[i]
+
+            # --- Stage 9 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (39632708.0/573591083.0)*k1[i] + (-433636366.0/683701615.0)*k4[i] + (-421739975.0/2616292301.0)*k5[i] + (100302831.0/723423059.0)*k6[i] + (790204164.0/839813087.0)*k7[i] + (800635310.0/3783071287.0)*k8[i]
+            ode_func(t + c9 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k9[i] = dt * dYdt[i]
+
+            # --- Stage 10 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (246121993.0/1340847787.0)*k1[i] + (-37695042795.0/15268766246.0)*k4[i] + (-309121744.0/1061227803.0)*k5[i] + (-12992083.0/490766935.0)*k6[i] + (6005943493.0/2108947869.0)*k7[i] + (393006217.0/1396673457.0)*k8[i] + (123872331.0/1001029789.0)*k9[i]
+            ode_func(t + c10 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k10[i] = dt * dYdt[i]
+
+            # --- Stage 11 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (-1028468189.0 / 846180014.0) * k1[i] + (8478235783.0 / 508512852.0) * k4[i] + (1311729495.0 / 1432422823.0) * k5[i] + (-10304129995.0 / 1701304382.0) * k6[i] + (-48777925059.0 / 3047939560.0) * k7[i] + (15336726248.0 / 1032824649.0) * k8[i] + (-45442868181.0 / 3398467696.0) * k9[i] + (3065993473.0 / 597172653.0) * k10[i]
+            ode_func(t + c11 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k11[i] = dt * dYdt[i]
+
+            # --- Stage 12 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (185892177.0 / 718116043.0) * k1[i] + (-3185094517.0 / 667107341.0) * k4[i] + (-477755414.0 / 1098053517.0) * k5[i] + (-703635378.0 / 230739211.0) * k6[i] + (5731566787.0 / 1027545527.0) * k7[i] + (5232866602.0 / 850066563.0) * k8[i] + (-4093664535.0 / 808688257.0) * k9[i] + (3962137247.0 / 1805957418.0) * k10[i] + (65686358.0 / 487910083.0) * k11[i]
+            ode_func(t + c12 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k12[i] = dt * dYdt[i]
+
+            # --- Stage 13 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (403863854.0 / 491063109.0) * k1[i] + (-5068492393.0 / 434740067.0) * k4[i] + (-411421997.0 / 543043805.0) * k5[i] + (652783627.0 / 914296604.0) * k6[i] + (11173962825.0 / 925320556.0) * k7[i] + (-13158990841.0 / 6184727034.0) * k8[i] + (3936647629.0 / 1978049680.0) * k9[i] + (-160528059.0 / 685178525.0) * k10[i] + (248638103.0 / 1413531060.0) * k11[i]
+            ode_func(t + c13 * dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k13[i] = dt * dYdt[i]
+
+            for i in range(_NUM_VARS):
+
+                y8_i = (Y[i] +
+                        b1 * k1[i] + b6 * k6[i] + b7 * k7[i] + b8 * k8[i] +
+                        b9 * k9[i] + b10 * k10[i] + b11 * k11[i] + b12 * k12[i] +
+                        b13 * k13[i])
+
+                Y_temp[i] = y8_i
+
+            for i in range(_NUM_VARS):
+
+                y5_i = (Y[i] +
+                        bs1*k1[i] + bs6*k6[i] + bs7*k7[i] + bs8*k8[i] +
+                        bs9*k9[i] + bs10*k10[i] + bs11*k11[i] + bs12*k12[i] +
+                        bs13*k13[i])
+
+                Y_err[i] = Y_temp[i] - y5_i
+
+            err_norm = comp_err_int(Y_err, _NUM_VARS)
+
+            if err_norm <= tol:
+
+                t += dt
+                step_count += 1
+
+                for i in range(_NUM_VARS):
+
+                    Y[i] = Y_temp[i]
+
+                for i in range(_NUM_VARS):
+
+                   Y_out[idx, i] = Y[i]
+
+                if err_norm == 0.0:
+
+                    scale = max_scale
+
+                else:
+
+                    scale = safety * math.pow(tol / err_norm, exponent)
+                    scale = min(max_scale, max(min_scale, scale))
+
+                dt = max(dt * scale, tiny)
+
+            else:
+
+                scale = safety * math.pow(tol / err_norm, exponent)
+                scale = max(min_scale, scale)
+                dt = dt * scale
+
+            if abs(dt) <= tiny:
+
+                break
+
+    return solver_adaptive_step
+
+# =========================================
+# Solver Kernel Variational Factory Function (Fixed Step)
+# =========================================
+def create_solver_kernel_variational(ode_func, num_vars: int, num_base_vars: int, num_dev_vectors: int):
+
+    """
+    Factory for a fixed-step DP8 kernel that integrates base variables,
+    deviation vectors, and auxiliary variables (like LD). Includes optional
+    renormalization of deviation vectors.
+
+    Assumes state vector Y structure:
+    [ base_vars (num_base_vars),
+      dev_vec_0 (num_base_vars),
+      dev_vec_1 (num_base_vars),
+      ...,
+      dev_vec_{M-1} (num_base_vars),
+      aux_vars (...) ]
+    where M = num_dev_vectors. Total size = num_vars.
+
+    Args:
+        ode_func: Numba CUDA device function `ode_func(t, Y, dYdt, params)`.
+        num_vars (int): Total number of variables in the state vector Y.
+        num_base_vars (int): Number of base phase space variables (e.g., 2*N).
+        num_dev_vectors (int): Number of deviation vectors (M).
+
+    Returns:
+        A Numba CUDA kernel function with signature:
+        `kernel(Y0, t0, dt, steps, params, renorm_interval, Y_out)`
+          - Y0: Initial states (GPU array).
+          - t0: Initial time.
+          - dt: Time step.
+          - steps: Number of steps.
+          - params: Tuple of parameters for ode_func.
+          - renorm_interval: Renormalize deviation vectors every N steps.
+                             Set <= 0 to disable.
+          - Y_out: Output array for final states (GPU array).
+    """
+
+    _NUM_VARS = num_vars
+    _NUM_BASE_VARS = num_base_vars
+    _NUM_DEV_VECTORS = num_dev_vectors
+
+    if _NUM_VARS != _NUM_BASE_VARS + _NUM_DEV_VECTORS * _NUM_BASE_VARS + 1:
+
+         print(f"Warning: num_vars ({_NUM_VARS}) may not match expected structure: "
+               f"base ({_NUM_BASE_VARS}) + M*base ({_NUM_DEV_VECTORS}*{_NUM_BASE_VARS}) + 1 (aux).")
+
+
+    @cuda.jit
+    def solver_fixed_step_variational(Y0, t0, dt, steps, params, renorm_interval, Y_out):
+
+        """
+        Fixed-step DP8 kernel for base + deviation vectors.
+        Generated by create_solver_kernel_variational.
+        (Internal Numba JIT function)
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        Y = cuda.local.array(_NUM_VARS, float64)
+
+        for i in range(_NUM_VARS): 
+
+            Y[i] = Y0[idx, i]
+
+        dYdt   = cuda.local.array(_NUM_VARS, float64)
+        k1     = cuda.local.array(_NUM_VARS, float64)
+        k2     = cuda.local.array(_NUM_VARS, float64)
+        k3     = cuda.local.array(_NUM_VARS, float64)
+        k4     = cuda.local.array(_NUM_VARS, float64)
+        k5     = cuda.local.array(_NUM_VARS, float64)
+        k6     = cuda.local.array(_NUM_VARS, float64)
+        k7     = cuda.local.array(_NUM_VARS, float64)
+        k8     = cuda.local.array(_NUM_VARS, float64)
+        k9     = cuda.local.array(_NUM_VARS, float64)
+        k10    = cuda.local.array(_NUM_VARS, float64)
+        k11    = cuda.local.array(_NUM_VARS, float64)
+        k12    = cuda.local.array(_NUM_VARS, float64)
+        k13    = cuda.local.array(_NUM_VARS, float64)
+        Y_temp = cuda.local.array(_NUM_VARS, float64)
+
+        c2 = 1.0/18.0; c3 = 1.0/12.0; c4 = 1.0/8.0; c5 = 5.0/16.0
+        c6 = 3.0/8.0; c7 = 59.0/400.0; c8 = 93.0/200.0
+        c9 = 5490023248.0/9719169821.0; c10 = 13.0/20.0
+        c11 = 1201146811.0/1299019798.0; c12 = 1.0; c13 = 1.0
+        b1 = 14005451.0/335480064.0; b6 = -59238493.0/1068277825.0
+        b7 = 181606767.0/758867731.0; b8 = 561292985.0/797845732.0
+        b9 = -1041891430.0/1371343529.0; b10 = 760417239.0/1151165299.0
+        b11 = 118820643.0/751138087.0; b12 = -528747749.0/2220607170.0
+        b13 = 1.0/4.0
+
+        t = t0
+
+        for step_i in range(steps):
+
+            # --- Stage 1 ---
+            ode_func(t, Y, dYdt, params)
+            for i in range(_NUM_VARS): k1[i] = dt * dYdt[i]
+
+            # --- Stage 2 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/18.0)*k1[i]
+            ode_func(t + c2*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k2[i] = dt * dYdt[i]
+
+            # --- Stage 3 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/48.0)*k1[i] + (1.0/16.0)*k2[i]
+            ode_func(t + c3*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k3[i] = dt * dYdt[i]
+
+            # --- Stage 4 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/32.0)*k1[i] + (3.0/32.0)*k3[i]
+            ode_func(t + c4*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k4[i] = dt * dYdt[i]
+
+            # --- Stage 5 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i]+ (5.0/16.0)*k1[i]+ (-75.0/64.0)*k3[i]+ (75.0/64.0)*k4[i]
+            ode_func(t + c5*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k5[i] = dt * dYdt[i]
+
+            # --- Stage 6 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i]+ (3.0/80.0)*k1[i]+ (3.0/16.0)*k4[i]+ (3.0/20.0)*k5[i]
+            ode_func(t + c6*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k6[i] = dt * dYdt[i]
+
+            # --- Stage 7 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i]+ (29443841.0/614563906.0)*k1[i]+ (77736538.0/692538347.0)*k4[i]+ (-28693883.0/1125000000.0)*k5[i]+ (23124283.0/1800000000.0)*k6[i]
+            ode_func(t + c7*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k7[i] = dt * dYdt[i]
+
+            # --- Stage 8 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (16016141.0/946692911.0)*k1[i] + (61564180.0/158732637.0)*k4[i] + (22789713.0/633445777.0)*k5[i] + (545815736.0/2771057229.0)*k6[i] + (-180193667.0/1043307555.0)*k7[i]
+            ode_func(t + c8*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k8[i] = dt * dYdt[i]
+
+            # --- Stage 9 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (39632708.0/573591083.0)*k1[i] + (-433636366.0/683701615.0)*k4[i] + (-421739975.0/2616292301.0)*k5[i] + (100302831.0/723423059.0)*k6[i] + (790204164.0/839813087.0)*k7[i] + (800635310.0/3783071287.0)*k8[i]
+            ode_func(t + c9*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k9[i] = dt * dYdt[i]
+
+            # --- Stage 10 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (246121993.0/1340847787.0)*k1[i] + (-37695042795.0/15268766246.0)*k4[i] + (-309121744.0/1061227803.0)*k5[i] + (-12992083.0/490766935.0)*k6[i] + (6005943493.0/2108947869.0)*k7[i] + (393006217.0/1396673457.0)*k8[i] + (123872331.0/1001029789.0)*k9[i]
+            ode_func(t + c10*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k10[i] = dt * dYdt[i]
+
+            # --- Stage 11 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (-1028468189.0/846180014.0)*k1[i] + (8478235783.0/508512852.0)*k4[i] + (1311729495.0/1432422823.0)*k5[i] + (-10304129995.0/1701304382.0)*k6[i] + (-48777925059.0/3047939560.0)*k7[i] + (15336726248.0/1032824649.0)*k8[i] + (-45442868181.0/3398467696.0)*k9[i] + (3065993473.0/597172653.0)*k10[i]
+            ode_func(t + c11*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k11[i] = dt * dYdt[i]
+
+            # --- Stage 12 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (185892177.0/718116043.0)*k1[i] + (-3185094517.0/667107341.0)*k4[i] + (-477755414.0/1098053517.0)*k5[i] + (-703635378.0/230739211.0)*k6[i] + (5731566787.0/1027545527.0)*k7[i] + (5232866602.0/850066563.0)*k8[i] + (-4093664535.0/808688257.0)*k9[i] + (3962137247.0/1805957418.0)*k10[i] + (65686358.0/487910083.0)*k11[i]
+            ode_func(t + c12*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k12[i] = dt * dYdt[i]
+
+            # --- Stage 13 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (403863854.0/491063109.0)*k1[i] + (-5068492393.0/434740067.0)*k4[i] + (-411421997.0/543043805.0)*k5[i] + (652783627.0/914296604.0)*k6[i] + (11173962825.0/925320556.0)*k7[i] + (-13158990841.0/6184727034.0)*k8[i] + (3936647629.0/1978049680.0)*k9[i] + (-160528059.0/685178525.0)*k10[i] + (248638103.0/1413531060.0)*k11[i]
+            ode_func(t + c13*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k13[i] = dt * dYdt[i]
+
+            for i in range(_NUM_VARS):
+
+                Y[i] += (b1 * k1[i] + b6 * k6[i] + b7 * k7[i] + b8 * k8[i] +
+                         b9 * k9[i] + b10 * k10[i] + b11 * k11[i] + b12 * k12[i] +
+                         b13 * k13[i])
+
+            t += dt
+
+            if renorm_interval > 0 and (step_i + 1) % renorm_interval == 0:
+
+                for m_idx in range(_NUM_DEV_VECTORS):
+
+                    base = _NUM_BASE_VARS + m_idx * _NUM_BASE_VARS
+
+                    norm_sq = 0.0
+
+                    for i in range(_NUM_BASE_VARS):
+
+                        val = Y[base + i]
+                        norm_sq += val * val
+
+                    inv_norm = 1.0 / math.sqrt(norm_sq)
+
+                    for i in range(_NUM_BASE_VARS):
+
+                        Y[base + i] *= inv_norm
+
+        for i in range(_NUM_VARS):
+
+            Y_out[idx, i] = Y[i]
+
+    return solver_fixed_step_variational
+
+# =========================================
+# Solver Kernel Variational Factory Function (Adaptive Step)
+# =========================================
+def create_solver_kernel_adaptive_variational(ode_func, num_vars: int, num_base_vars: int, num_dev_vectors: int):
+
+    """
+    Factory for an *adaptive-step* DP8(5) kernel that integrates base variables,
+    deviation vectors, and auxiliary variables. Includes optional renormalization
+    of deviation vectors after accepted steps.
+
+    Assumes state vector Y structure:
+    [ base_vars (num_base_vars),
+      dev_vec_0 (num_base_vars),
+      dev_vec_1 (num_base_vars),
+      ...,
+      dev_vec_{M-1} (num_base_vars),
+      aux_vars (...) ]
+    where M = num_dev_vectors. Total size = num_vars.
+
+    Args:
+        ode_func: Numba CUDA device function `ode_func(t, Y, dYdt, params)`.
+        num_vars (int): Total number of variables in the state vector Y.
+        num_base_vars (int): Number of base phase space variables (e.g., 2*N).
+        num_dev_vectors (int): Number of deviation vectors (M).
+
+    Returns:
+        A Numba CUDA kernel function with signature:
+        `kernel(Y0, t0, t_final, params, tol, dt_initial, max_steps, renorm_interval, Y_out)`
+          - Y0: Initial states (GPU array).
+          - t0: Initial time.
+          - t_final: Target final time.
+          - params: Tuple of parameters for ode_func.
+          - tol: Absolute error tolerance for step control.
+          - dt_initial: Initial guess for the time step.
+          - max_steps: Maximum number of adaptive steps allowed.
+          - renorm_interval: Renormalize deviation vectors every N *accepted* steps.
+                             Set <= 0 to disable.
+          - Y_out: Output array for final states (GPU array). Contains state at
+                   last accepted step time.
+    """
+
+    _NUM_VARS = num_vars
+    _NUM_BASE_VARS = num_base_vars
+    _NUM_DEV_VECTORS = num_dev_vectors
+
+    if _NUM_VARS != _NUM_BASE_VARS + _NUM_DEV_VECTORS * _NUM_BASE_VARS + 1:
+
+         print(f"Warning: num_vars ({_NUM_VARS}) may not match expected structure: "
+               f"base ({_NUM_BASE_VARS}) + M*base ({_NUM_DEV_VECTORS}*{_NUM_BASE_VARS}) + 1 (aux).")
+
+    @cuda.jit
+    def solver_adaptive_step_variational(Y0, t0, t_final, params, tol, dt_initial, max_steps, renorm_interval, Y_out):
+        
+        """
+        Adaptive-step DP8(5) kernel for base + deviation vectors.
+        Generated by create_solver_kernel_adaptive_variational.
+        (Internal Numba JIT function)
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        Y = cuda.local.array(_NUM_VARS, float64)
+        for i in range(_NUM_VARS): Y[i] = Y0[idx, i]
+
+        dYdt   = cuda.local.array(_NUM_VARS, float64)
+        k1     = cuda.local.array(_NUM_VARS, float64)
+        k2     = cuda.local.array(_NUM_VARS, float64)
+        k3     = cuda.local.array(_NUM_VARS, float64)
+        k4     = cuda.local.array(_NUM_VARS, float64)
+        k5     = cuda.local.array(_NUM_VARS, float64)
+        k6     = cuda.local.array(_NUM_VARS, float64)
+        k7     = cuda.local.array(_NUM_VARS, float64)
+        k8     = cuda.local.array(_NUM_VARS, float64)
+        k9     = cuda.local.array(_NUM_VARS, float64)
+        k10    = cuda.local.array(_NUM_VARS, float64)
+        k11    = cuda.local.array(_NUM_VARS, float64)
+        k12    = cuda.local.array(_NUM_VARS, float64)
+        k13    = cuda.local.array(_NUM_VARS, float64)
+        Y_temp = cuda.local.array(_NUM_VARS, float64)
+        Y_err  = cuda.local.array(_NUM_VARS, float64)
+
+        c2 = 1.0/18.0; c3 = 1.0/12.0; c4 = 1.0/8.0; c5 = 5.0/16.0
+        c6 = 3.0/8.0; c7 = 59.0/400.0; c8 = 93.0/200.0
+        c9 = 5490023248.0/9719169821.0; c10 = 13.0/20.0
+        c11 = 1201146811.0/1299019798.0; c12 = 1.0; c13 = 1.0
+        b1 = 14005451.0/335480064.0; b6 = -59238493.0/1068277825.0
+        b7 = 181606767.0/758867731.0; b8 = 561292985.0/797845732.0
+        b9 = -1041891430.0/1371343529.0; b10 = 760417239.0/1151165299.0
+        b11 = 118820643.0/751138087.0; b12 = -528747749.0/2220607170.0
+        b13 = 1.0/4.0
+        bs1 = 13451932.0/455176623.0; bs6 = -808719846.0/976000145.0
+        bs7 = 1757004468.0/5645159321.0; bs8 = 656045339.0/265891186.0
+        bs9 = -3867574721.0/1518517206.0; bs10 = 465885868.0/322736535.0
+        bs11 = 53011238.0/667516719.0; bs12 = 2.0/45.0; bs13 = 0.0
+
+        t = t0
+        dt = dt_initial
+        step_count = 0
+        safety = 0.9; min_scale = 0.2; max_scale = 5.0
+        exponent = 1.0 / 6.0
+        tiny = 1e-30
+
+        while (t < t_final) and (step_count < max_steps):
+
+            if (t + dt > t_final):
+
+                dt = t_final - t
+
+            # --- Stage 1 ---
+            ode_func(t, Y, dYdt, params)
+            for i in range(_NUM_VARS): k1[i] = dt * dYdt[i]
+
+            # --- Stage 2 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + c2*k1[i]
+            ode_func(t + c2*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k2[i] = dt * dYdt[i]
+
+            # --- Stage 3 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/48.0)*k1[i] + (1.0/16.0)*k2[i]
+            ode_func(t + c3*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k3[i] = dt * dYdt[i]
+
+            # --- Stage 4 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/32.0)*k1[i] + (3.0/32.0)*k3[i]
+            ode_func(t + c4*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k4[i] = dt * dYdt[i]
+
+            # --- Stage 5 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (5.0/16.0)*k1[i] + (-75.0/64.0)*k3[i] + (75.0/64.0)*k4[i]
+            ode_func(t + c5*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k5[i] = dt * dYdt[i]
+
+            # --- Stage 6 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (3.0/80.0)*k1[i] + (3.0/16.0)*k4[i] + (3.0/20.0)*k5[i]
+            ode_func(t + c6*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k6[i] = dt * dYdt[i]
+
+            # --- Stage 7 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (29443841.0/614563906.0)*k1[i] + (77736538.0/692538347.0)*k4[i] + (-28693883.0/1125000000.0)*k5[i] + (23124283.0/1800000000.0)*k6[i]
+            ode_func(t + c7*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k7[i] = dt * dYdt[i]
+
+            # --- Stage 8 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (16016141.0/946692911.0)*k1[i] + (61564180.0/158732637.0)*k4[i] + (22789713.0/633445777.0)*k5[i] + (545815736.0/2771057229.0)*k6[i] + (-180193667.0/1043307555.0)*k7[i]
+            ode_func(t + c8*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k8[i] = dt * dYdt[i]
+
+            # --- Stage 9 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (39632708.0/573591083.0)*k1[i] + (-433636366.0/683701615.0)*k4[i] + (-421739975.0/2616292301.0)*k5[i] + (100302831.0/723423059.0)*k6[i] + (790204164.0/839813087.0)*k7[i] + (800635310.0/3783071287.0)*k8[i]
+            ode_func(t + c9*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k9[i] = dt * dYdt[i]
+
+            # --- Stage 10 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (246121993.0/1340847787.0)*k1[i] + (-37695042795.0/15268766246.0)*k4[i] + (-309121744.0/1061227803.0)*k5[i] + (-12992083.0/490766935.0)*k6[i] + (6005943493.0/2108947869.0)*k7[i] + (393006217.0/1396673457.0)*k8[i] + (123872331.0/1001029789.0)*k9[i]
+            ode_func(t + c10*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k10[i] = dt * dYdt[i]
+
+            # --- Stage 11 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (-1028468189.0/846180014.0)*k1[i] + (8478235783.0/508512852.0)*k4[i] + (1311729495.0/1432422823.0)*k5[i] + (-10304129995.0/1701304382.0)*k6[i] + (-48777925059.0/3047939560.0)*k7[i] + (15336726248.0/1032824649.0)*k8[i] + (-45442868181.0/3398467696.0)*k9[i] + (3065993473.0/597172653.0)*k10[i]
+            ode_func(t + c11*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k11[i] = dt * dYdt[i]
+
+            # --- Stage 12 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (185892177.0/718116043.0)*k1[i] + (-3185094517.0/667107341.0)*k4[i] + (-477755414.0/1098053517.0)*k5[i] + (-703635378.0/230739211.0)*k6[i] + (5731566787.0/1027545527.0)*k7[i] + (5232866602.0/850066563.0)*k8[i] + (-4093664535.0/808688257.0)*k9[i] + (3962137247.0/1805957418.0)*k10[i] + (65686358.0/487910083.0)*k11[i]
+            ode_func(t + c12*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k12[i] = dt * dYdt[i]
+
+            # --- Stage 13 ---
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (403863854.0/491063109.0)*k1[i] + (-5068492393.0/434740067.0)*k4[i] + (-411421997.0/543043805.0)*k5[i] + (652783627.0/914296604.0)*k6[i] + (11173962825.0/925320556.0)*k7[i] + (-13158990841.0/6184727034.0)*k8[i] + (3936647629.0/1978049680.0)*k9[i] + (-160528059.0/685178525.0)*k10[i] + (248638103.0/1413531060.0)*k11[i]
+            ode_func(t + c13*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k13[i] = dt * dYdt[i]
+
+            for i in range(_NUM_VARS):
+
+                y8_i = (Y[i] + b1*k1[i] + b6*k6[i] + b7*k7[i] + b8*k8[i] +
+                        b9*k9[i] + b10*k10[i] + b11*k11[i] + b12*k12[i] + b13*k13[i])
+
+                y5_i = (Y[i] + bs1*k1[i] + bs6*k6[i] + bs7*k7[i] + bs8*k8[i] +
+                        bs9*k9[i] + bs10*k10[i] + bs11*k11[i] + bs12*k12[i] + bs13*k13[i])
+
+                Y_temp[i] = y8_i
+                Y_err[i] = y8_i - y5_i
+
+            err_norm = comp_err_int(Y_err, _NUM_VARS)
+
+            if err_norm <= tol:
+
+                t += dt
+                step_count += 1
+
+                for i in range(_NUM_VARS):
+
+                    Y[i] = Y_temp[i]
+
+                for i in range(_NUM_VARS):
+
+                    Y_out[idx, i] = Y[i]
+
+                if renorm_interval > 0 and step_count % renorm_interval == 0:
+
+                    for m_idx in range(_NUM_DEV_VECTORS):
+                    
+                        base = _NUM_BASE_VARS + m_idx * _NUM_BASE_VARS
+                     
+                        norm_sq = 0.0
+
+                        for i in range(_NUM_BASE_VARS):
+
+                            val = Y[base + i]
+                            norm_sq += val * val
+
+                        inv_norm = 1.0 / math.sqrt(norm_sq)
+
+                        for i in range(_NUM_BASE_VARS):
+
+                            Y[base + i] *= inv_norm
+
+                if err_norm == 0.0: scale = max_scale
+                else: scale = safety * math.pow(tol / err_norm, exponent)
+                scale = min(max_scale, max(min_scale, scale))
+                dt = max(dt * scale, tiny)
+
+            else:
+
+                scale = safety * math.pow(tol / (err_norm + tiny), exponent)
+                scale = max(min_scale, scale)
+                dt = dt * scale
+
+            if abs(dt) <= tiny:
+
+                break
+
+    return solver_adaptive_step_variational
+
+# =========================================
+# Solver Kernel Lyapunov Exponent QR Factory Function (Fixed Step)
+# =========================================
+def create_solver_kernel_fixed_LE_QR(ode_func, num_vars: int, num_base_vars: int, num_dev_vectors: int):
+
+    """
+    Factory for a fixed-step DP8 kernel that integrates base variables,
+    deviation vectors, and auxiliary variables, AND calculates Lyapunov Exponent
+    sums using periodic QR decomposition (Modified Gram-Schmidt) within the kernel.
+
+    Assumes state vector Y structure:
+    [ base_vars (num_base_vars),                 Indices 0 to nb-1
+      dev_vec_0 (num_base_vars),                 Indices nb to 2*nb-1
+      ...,
+      dev_vec_{M-1} (num_base_vars),             Indices nb+M*nb-nb to nb+M*nb-1
+      aux_var_0 (e.g., LD),                      Index nb*(1+M)
+      LE_sum_0,                                  Index nb*(1+M)+1
+      ...,
+      LE_sum_{M-1}                               Index nb*(1+M)+M ]
+    where nb = num_base_vars, M = num_dev_vectors.
+    Total size = num_vars = nb*(1+M) + 1 + M.
+
+    Args:
+        ode_func: Numba CUDA device function `ode_func(t, Y, dYdt, params)`.
+        num_vars (int): Total number of variables in the state vector Y.
+                        Must match nb*(1+M) + 1 + M.
+        num_base_vars (int): Number of base phase space variables (e.g., 2*N).
+        num_dev_vectors (int): Number of deviation vectors / LEs to calculate (M).
+
+    Returns:
+        A Numba CUDA kernel function with signature:
+        `kernel(Y0, t0, dt, steps, params, qr_interval, Y_out)`
+          - Y0: Initial states (GPU array, must include space for LE sums initialized to 0).
+          - t0: Initial time.
+          - dt: Fixed time step.
+          - steps: Number of integration steps.
+          - params: Tuple of parameters for ode_func.
+          - qr_interval: Perform QR decomp/LE accumulation every N steps.
+                         Set <= 0 to disable LE calculation/QR.
+          - Y_out: Output array for final states (GPU array). Contains state at
+                   t0 + steps*dt, including final LE sums.
+    """
+
+    _NUM_VARS = num_vars
+    _NUM_BASE_VARS = num_base_vars
+    _NUM_DEV_VECTORS = num_dev_vectors
+
+    _EXPECTED_NUM_VARS = _NUM_BASE_VARS * (1 + _NUM_DEV_VECTORS) + 1 + _NUM_DEV_VECTORS
+
+    if _NUM_VARS != _EXPECTED_NUM_VARS:
+
+         raise ValueError(f"num_vars ({_NUM_VARS}) does not match expected structure for LE calc: "
+               f"base({_NUM_BASE_VARS}) + M*base({_NUM_DEV_VECTORS}) + aux(1) + LE_sums({_NUM_DEV_VECTORS}) = {_EXPECTED_NUM_VARS}. "
+               "Check state vector definition.")
+
+    _DEV_VEC_START_IDX = _NUM_BASE_VARS
+    _LE_SUM_START_IDX = _NUM_BASE_VARS * (1 + _NUM_DEV_VECTORS) + 1
+
+    @cuda.jit
+    def solver_fixed_step_LE_QR(Y0, t0, dt, steps, params, qr_interval, Y_out):
+
+        """
+        Fixed-step DP8 kernel with periodic QR LE calculation.
+        Generated by create_solver_kernel_fixed_LE_QR.
+        (Internal Numba JIT function)
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        Y = cuda.local.array(_NUM_VARS, float64)
+        for i in range(_NUM_VARS): Y[i] = Y0[idx, i]
+
+        dYdt   = cuda.local.array(_NUM_VARS, float64)
+        k1     = cuda.local.array(_NUM_VARS, float64)
+        k2     = cuda.local.array(_NUM_VARS, float64)
+        k3     = cuda.local.array(_NUM_VARS, float64) 
+        k4     = cuda.local.array(_NUM_VARS, float64)
+        k5     = cuda.local.array(_NUM_VARS, float64) 
+        k6     = cuda.local.array(_NUM_VARS, float64)
+        k7     = cuda.local.array(_NUM_VARS, float64) 
+        k8     = cuda.local.array(_NUM_VARS, float64)
+        k9     = cuda.local.array(_NUM_VARS, float64) 
+        k10    = cuda.local.array(_NUM_VARS, float64)
+        k11    = cuda.local.array(_NUM_VARS, float64) 
+        k12    = cuda.local.array(_NUM_VARS, float64)
+        k13    = cuda.local.array(_NUM_VARS, float64)
+        Y_temp = cuda.local.array(_NUM_VARS, float64)
+
+        A_local = cuda.local.array((_NUM_BASE_VARS, _NUM_DEV_VECTORS), dtype=float64)
+        R_diag_local = cuda.local.array(_NUM_DEV_VECTORS, dtype=float64)
+
+        c2=1/18; c3=1/12; c4=1/8; c5=5/16; c6=3/8; c7=59/400; c8=93/200
+        c9=5490023248/9719169821; c10=13/20; c11=1201146811/1299019798; c12=1; c13=1
+        b1=14005451/335480064; b6=-59238493/1068277825; b7=181606767/758867731
+        b8=561292985/797845732; b9=-1041891430/1371343529; b10=760417239/1151165299
+        b11=118820643/751138087; b12=-528747749/2220607170; b13=1/4
+
+        t = t0
+
+        for step_i in range(steps):
+            
+            # --- Stage 1 ---
+            ode_func(t, Y, dYdt, params)
+            for i in range(_NUM_VARS): k1[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + c2*k1[i]
+
+            # --- Stage 2 ---
+            ode_func(t + c2*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k2[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1/48)*k1[i] + (1/16)*k2[i]
+
+            # --- Stage 3 ---
+            ode_func(t + c3*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k3[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1/32)*k1[i] + (3/32)*k3[i]
+
+            # --- Stage 4 ---
+            ode_func(t + c4*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k4[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i]+ (5/16)*k1[i]+ (-75/64)*k3[i]+ (75/64)*k4[i]
+
+            # --- Stage 5 ---
+            ode_func(t + c5*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k5[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i]+ (3/80)*k1[i]+ (3/16)*k4[i]+ (3/20)*k5[i]
+
+            # --- Stage 6 ---
+            ode_func(t + c6*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k6[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i]+ (29443841/614563906)*k1[i]+ (77736538/692538347)*k4[i]+ (-28693883/1125000000)*k5[i]+ (23124283/1800000000)*k6[i]
+
+            # --- Stage 7 ---
+            ode_func(t + c7*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k7[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (16016141/946692911)*k1[i] + (61564180/158732637)*k4[i] + (22789713/633445777)*k5[i] + (545815736/2771057229)*k6[i] + (-180193667/1043307555)*k7[i]
+
+            # --- Stage 8 ---
+            ode_func(t + c8*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k8[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (39632708/573591083)*k1[i] + (-433636366/683701615)*k4[i] + (-421739975/2616292301)*k5[i] + (100302831/723423059)*k6[i] + (790204164/839813087)*k7[i] + (800635310/3783071287)*k8[i]
+
+            # --- Stage 9 ---
+            ode_func(t + c9*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k9[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (246121993/1340847787)*k1[i] + (-37695042795/15268766246)*k4[i] + (-309121744/1061227803)*k5[i] + (-12992083/490766935)*k6[i] + (6005943493/2108947869)*k7[i] + (393006217/1396673457)*k8[i] + (123872331/1001029789)*k9[i]
+
+            # --- Stage 10 ---
+            ode_func(t + c10*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k10[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (-1028468189/846180014)*k1[i] + (8478235783/508512852)*k4[i] + (1311729495/1432422823)*k5[i] + (-10304129995/1701304382)*k6[i] + (-48777925059/3047939560)*k7[i] + (15336726248/1032824649)*k8[i] + (-45442868181/3398467696)*k9[i] + (3065993473/597172653)*k10[i]
+
+            # --- Stage 11 ---
+            ode_func(t + c11*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k11[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (185892177/718116043)*k1[i] + (-3185094517/667107341)*k4[i] + (-477755414/1098053517)*k5[i] + (-703635378/230739211)*k6[i] + (5731566787/1027545527)*k7[i] + (5232866602/850066563)*k8[i] + (-4093664535/808688257)*k9[i] + (3962137247/1805957418)*k10[i] + (65686358/487910083)*k11[i]
+
+            # --- Stage 12 ---
+            ode_func(t + c12*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k12[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (403863854/491063109)*k1[i] + (-5068492393/434740067)*k4[i] + (-411421997/543043805)*k5[i] + (652783627/914296604)*k6[i] + (11173962825/925320556)*k7[i] + (-13158990841/6184727034)*k8[i] + (3936647629/1978049680)*k9[i] + (-160528059/685178525)*k10[i] + (248638103/1413531060)*k11[i]
+
+            # --- Stage 13 ---
+            ode_func(t + c13*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k13[i] = dt * dYdt[i]
+
+            for i in range(_NUM_VARS):
+
+                Y[i] += (b1 * k1[i] + b6 * k6[i] + b7 * k7[i] + b8 * k8[i] +
+                         b9 * k9[i] + b10 * k10[i] + b11 * k11[i] + b12 * k12[i] +
+                         b13 * k13[i])
+
+            t += dt
+
+            if qr_interval > 0 and (step_i + 1) % qr_interval == 0:
+               
+                for m in range(_NUM_DEV_VECTORS):
+
+                    dev_vec_start_in_Y = _DEV_VEC_START_IDX + m * _NUM_BASE_VARS
+
+                    for row in range(_NUM_BASE_VARS):
+
+                        A_local[row, m] = Y[dev_vec_start_in_Y + row]
+
+                mgs_QR(A_local, R_diag_local, _NUM_BASE_VARS, _NUM_DEV_VECTORS)
+
+                for j in range(_NUM_DEV_VECTORS):
+
+                    R_jj = R_diag_local[j]
+
+                    Y[_LE_SUM_START_IDX + j] += math.log(abs(R_jj))
+
+                for m in range(_NUM_DEV_VECTORS):
+
+                    dev_vec_start_in_Y = _DEV_VEC_START_IDX + m * _NUM_BASE_VARS
+
+                    for row in range(_NUM_BASE_VARS):
+
+                        Y[dev_vec_start_in_Y + row] = A_local[row, m]
+
+        for i in range(_NUM_VARS):
+
+            Y_out[idx, i] = Y[i]
+
+    return solver_fixed_step_LE_QR
+
+# =========================================
+# Solver Kernel Lyapunov Exponent QR Factory Function (Adaptive Step)
+# =========================================
+def create_solver_kernel_LE_QR(ode_func, num_vars: int, num_base_vars: int, num_dev_vectors: int):
+
+    """
+    Factory for an adaptive DP8(5) kernel that integrates base variables,
+    deviation vectors, and auxiliary variables, AND calculates Lyapunov Exponent
+    sums using periodic QR decomposition (Modified Gram-Schmidt) within the kernel.
+
+    Assumes state vector Y structure:
+    [ base_vars (num_base_vars),                 Indices 0 to nb-1
+      dev_vec_0 (num_base_vars),                 Indices nb to 2*nb-1
+      ...,
+      dev_vec_{M-1} (num_base_vars),             Indices nb+M*nb-nb to nb+M*nb-1
+      aux_var_0 (e.g., LD),                      Index nb*(1+M)
+      LE_sum_0,                                  Index nb*(1+M)+1
+      ...,
+      LE_sum_{M-1}                               Index nb*(1+M)+M ]
+    where nb = num_base_vars, M = num_dev_vectors.
+    Total size = num_vars = nb*(1+M) + 1 + M.
+
+    Args:
+        ode_func: Numba CUDA device function `ode_func(t, Y, dYdt, params)`.
+        num_vars (int): Total number of variables in the state vector Y.
+                        Must match nb*(1+M) + 1 + M.
+        num_base_vars (int): Number of base phase space variables (e.g., 2*N).
+        num_dev_vectors (int): Number of deviation vectors / LEs to calculate (M).
+
+    Returns:
+        A Numba CUDA kernel function with signature:
+        `kernel(Y0, t0, t_final, params, tol, dt_initial, max_steps, qr_interval, Y_out)`
+          - Y0: Initial states (GPU array, must include space for LE sums initialized to 0).
+          - t0: Initial time.
+          - t_final: Target final time.
+          - params: Tuple of parameters for ode_func.
+          - tol: Absolute error tolerance for step control.
+          - dt_initial: Initial guess for the time step.
+          - max_steps: Maximum number of adaptive steps allowed.
+          - qr_interval: Perform QR decomp/LE accumulation every N *accepted* steps.
+                         Set <= 0 to disable LE calculation/QR.
+          - Y_out: Output array for final states (GPU array). Contains state at
+                   last accepted step time, including final LE sums.
+    """
+
+    _NUM_VARS = num_vars
+    _NUM_BASE_VARS = num_base_vars
+    _NUM_DEV_VECTORS = num_dev_vectors
+
+    _EXPECTED_NUM_VARS = _NUM_BASE_VARS * (1 + _NUM_DEV_VECTORS) + 1 + _NUM_DEV_VECTORS
+
+    if _NUM_VARS != _EXPECTED_NUM_VARS:
+
+         raise ValueError(f"num_vars ({_NUM_VARS}) does not match expected structure for LE calc: "
+               f"base({_NUM_BASE_VARS}) + M*base({_NUM_DEV_VECTORS}) + aux(1) + LE_sums({_NUM_DEV_VECTORS}) = {_EXPECTED_NUM_VARS}. "
+               "Check state vector definition.")
+
+    _DEV_VEC_START_IDX = _NUM_BASE_VARS
+    _LE_SUM_START_IDX = _NUM_BASE_VARS * (1 + _NUM_DEV_VECTORS) + 1
+
+    @cuda.jit
+    def solver_adaptive_step_LE_QR(Y0, t0, t_final, params, tol, dt_initial, max_steps, qr_interval, Y_out):
+
+        """
+        Adaptive-step DP8(5) kernel with periodic QR-based LE calculation.
+        Generated by create_solver_kernel_LE_QR.
+        (Internal Numba JIT function)
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        Y = cuda.local.array(_NUM_VARS, float64)
+        for i in range(_NUM_VARS): Y[i] = Y0[idx, i]
+
+        dYdt   = cuda.local.array(_NUM_VARS, float64)
+        k1     = cuda.local.array(_NUM_VARS, float64)
+        k2     = cuda.local.array(_NUM_VARS, float64)
+        k3     = cuda.local.array(_NUM_VARS, float64)
+        k4     = cuda.local.array(_NUM_VARS, float64)
+        k5     = cuda.local.array(_NUM_VARS, float64)
+        k6     = cuda.local.array(_NUM_VARS, float64)
+        k7     = cuda.local.array(_NUM_VARS, float64)
+        k8     = cuda.local.array(_NUM_VARS, float64)
+        k9     = cuda.local.array(_NUM_VARS, float64)
+        k10    = cuda.local.array(_NUM_VARS, float64)
+        k11    = cuda.local.array(_NUM_VARS, float64)
+        k12    = cuda.local.array(_NUM_VARS, float64)
+        k13    = cuda.local.array(_NUM_VARS, float64)
+        Y_temp = cuda.local.array(_NUM_VARS, float64)
+        Y_err  = cuda.local.array(_NUM_VARS, float64)
+
+        A_local = cuda.local.array((_NUM_BASE_VARS, _NUM_DEV_VECTORS), dtype=float64)
+        R_diag_local = cuda.local.array(_NUM_DEV_VECTORS, dtype=float64)
+
+        c2=1/18; c3=1/12; c4=1/8; c5=5/16; c6=3/8; c7=59/400; c8=93/200
+        c9=5490023248/9719169821; c10=13/20; c11=1201146811/1299019798; c12=1; c13=1
+        b1=14005451/335480064; b6=-59238493/1068277825; b7=181606767/758867731
+        b8=561292985/797845732; b9=-1041891430/1371343529; b10=760417239/1151165299
+        b11=118820643/751138087; b12=-528747749/2220607170; b13=1/4
+        bs1=13451932/455176623; bs6=-808719846/976000145; bs7=1757004468/5645159321
+        bs8=656045339/265891186; bs9=-3867574721/1518517206; bs10=465885868/322736535
+        bs11=53011238/667516719; bs12=2/45; bs13=0
+
+        t = t0
+        dt = dt_initial
+        step_count = 0
+        safety = 0.9; min_scale = 0.2; max_scale = 5.0
+        exponent = 1.0 / 6.0
+        tiny = 1e-30
+
+        while (t < t_final) and (step_count < max_steps):
+
+            if (t + dt > t_final): 
+
+                dt = t_final - t
+
+            # --- Stage 1 ---
+            ode_func(t, Y, dYdt, params)
+            for i in range(_NUM_VARS): k1[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + c2*k1[i]
+
+            # --- Stage 2 ---
+            ode_func(t + c2*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k2[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/48.0)*k1[i] + (1.0/16.0)*k2[i]
+
+            # --- Stage 3 ---
+            ode_func(t + c3*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k3[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (1.0/32.0)*k1[i] + (3.0/32.0)*k3[i]
+
+            # --- Stage 4 ---
+            ode_func(t + c4*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k4[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (5.0/16.0)*k1[i] + (-75.0/64.0)*k3[i] + (75.0/64.0)*k4[i]
+
+            # --- Stage 5 ---
+            ode_func(t + c5*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k5[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (3.0/80.0)*k1[i] + (3.0/16.0)*k4[i] + (3.0/20.0)*k5[i]
+
+            # --- Stage 6 ---
+            ode_func(t + c6*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k6[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (29443841.0/614563906.0)*k1[i] + (77736538.0/692538347.0)*k4[i] + (-28693883.0/1125000000.0)*k5[i] + (23124283.0/1800000000.0)*k6[i]
+
+            # --- Stage 7 ---
+            ode_func(t + c7*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k7[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (16016141.0/946692911.0)*k1[i] + (61564180.0/158732637.0)*k4[i] + (22789713.0/633445777.0)*k5[i] + (545815736.0/2771057229.0)*k6[i] + (-180193667.0/1043307555.0)*k7[i]
+
+            # --- Stage 8 ---
+            ode_func(t + c8*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k8[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (39632708.0/573591083.0)*k1[i] + (-433636366.0/683701615.0)*k4[i] + (-421739975.0/2616292301.0)*k5[i] + (100302831.0/723423059.0)*k6[i] + (790204164.0/839813087.0)*k7[i] + (800635310.0/3783071287.0)*k8[i]
+
+            # --- Stage 9 ---
+            ode_func(t + c9*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k9[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (246121993.0/1340847787.0)*k1[i] + (-37695042795.0/15268766246.0)*k4[i] + (-309121744.0/1061227803.0)*k5[i] + (-12992083.0/490766935.0)*k6[i] + (6005943493.0/2108947869.0)*k7[i] + (393006217.0/1396673457.0)*k8[i] + (123872331.0/1001029789.0)*k9[i]
+
+            # --- Stage 10 ---
+            ode_func(t + c10*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k10[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (-1028468189.0/846180014.0)*k1[i] + (8478235783.0/508512852.0)*k4[i] + (1311729495.0/1432422823.0)*k5[i] + (-10304129995.0/1701304382.0)*k6[i] + (-48777925059.0/3047939560.0)*k7[i] + (15336726248.0/1032824649.0)*k8[i] + (-45442868181.0/3398467696.0)*k9[i] + (3065993473.0/597172653.0)*k10[i]
+
+            # --- Stage 11 ---
+            ode_func(t + c11*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k11[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (185892177.0/718116043.0)*k1[i] + (-3185094517.0/667107341.0)*k4[i] + (-477755414.0/1098053517.0)*k5[i] + (-703635378.0/230739211.0)*k6[i] + (5731566787.0/1027545527.0)*k7[i] + (5232866602.0/850066563.0)*k8[i] + (-4093664535.0/808688257.0)*k9[i] + (3962137247.0/1805957418.0)*k10[i] + (65686358.0/487910083.0)*k11[i]
+            
+            # --- Stage 12 ---
+            ode_func(t + c12*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k12[i] = dt * dYdt[i]
+            for i in range(_NUM_VARS): Y_temp[i] = Y[i] + (403863854.0/491063109.0)*k1[i] + (-5068492393.0/434740067.0)*k4[i] + (-411421997.0/543043805.0)*k5[i] + (652783627.0/914296604.0)*k6[i] + (11173962825.0/925320556.0)*k7[i] + (-13158990841.0/6184727034.0)*k8[i] + (3936647629.0/1978049680.0)*k9[i] + (-160528059.0/685178525.0)*k10[i] + (248638103.0/1413531060.0)*k11[i]
+
+            # --- Stage 13 ---
+            ode_func(t + c13*dt, Y_temp, dYdt, params)
+            for i in range(_NUM_VARS): k13[i] = dt * dYdt[i]
+
+            for i in range(_NUM_VARS):
+
+                y8_i = (Y[i] + b1*k1[i] + b6*k6[i] + b7*k7[i] + b8*k8[i] +
+                        b9*k9[i] + b10*k10[i] + b11*k11[i] + b12*k12[i] + b13*k13[i])
+
+                y5_i = (Y[i] + bs1*k1[i] + bs6*k6[i] + bs7*k7[i] + bs8*k8[i] +
+                        bs9*k9[i] + bs10*k10[i] + bs11*k11[i] + bs12*k12[i] + bs13*k13[i])
+
+                Y_temp[i] = y8_i
+                Y_err[i] = y8_i - y5_i
+
+            err_norm = comp_err_int(Y_err, _NUM_VARS)
+
+            if err_norm <= tol:
+
+                t += dt
+                step_count += 1
+
+                for i in range(_NUM_VARS): 
+                    
+                    Y[i] = Y_temp[i]
+
+                if qr_interval > 0 and step_count % qr_interval == 0:
+                    
+                    for m in range(_NUM_DEV_VECTORS):
+
+                        dev_vec_start_in_Y = _DEV_VEC_START_IDX + m * _NUM_BASE_VARS
+
+                        for row in range(_NUM_BASE_VARS):
+
+                            A_local[row, m] = Y[dev_vec_start_in_Y + row]
+
+                    mgs_QR(A_local, R_diag_local, _NUM_BASE_VARS, _NUM_DEV_VECTORS)
+
+                    for j in range(_NUM_DEV_VECTORS):
+                        
+                        R_jj = R_diag_local[j]
+
+                        Y[_LE_SUM_START_IDX + j] += math.log(abs(R_jj))
+
+                    for m in range(_NUM_DEV_VECTORS):
+
+                        dev_vec_start_in_Y = _DEV_VEC_START_IDX + m * _NUM_BASE_VARS
+
+                        for row in range(_NUM_BASE_VARS):
+
+                            Y[dev_vec_start_in_Y + row] = A_local[row, m]
+
+                for i in range(_NUM_VARS): 
+                    
+                    Y_out[idx, i] = Y[i]
+
+                if err_norm == 0.0: scale = max_scale
+                else: scale = safety * math.pow(tol / err_norm, exponent)
+                scale = min(max_scale, max(min_scale, scale))
+                dt = max(dt * scale, tiny)
+
+            else:
+
+                scale = safety * math.pow(tol / (err_norm + tiny), exponent)
+                scale = max(min_scale, scale)
+                dt = dt * scale
+
+            if abs(dt) <= tiny: break
+
+    return solver_adaptive_step_LE_QR
+
+# =========================================
+# Basic symplectic kernel
+# =========================================
+def create_yoshida6_symplectic_kernel(grad_T_device, grad_V_device, dof: int, solution: str = "A"):
+
+    """
+    Factory function that creates a Numba CUDA kernel for a fixed-step
+    6th-order Yoshida symplectic integrator (for separable H = T(p) + V(q)).
+
+    The Yoshida method is a symplectic integrator that preserves the symplectic
+    structure of Hamiltonian systems. For separable Hamiltonians H(q,p) = T(p) + V(q),
+    it uses a composition of "drift" (updating q using T) and "kick" (updating p
+    using V) operations. The 6th-order method uses 8 kicks and 9 drifts per step.
+
+    Args:
+        grad_T_device: A Numba CUDA *device function* that computes the gradient
+                       of the kinetic energy T with respect to momentum p.
+                       Must have signature: `grad_T_device(p, dT_out, params_T, dof)`,
+                       where:
+                         - p: current momentum vector (1D Numba array, size dof)
+                         - dT_out: output array to store dT/dp (1D Numba array, size dof)
+                         - params_T: tuple of parameters for kinetic energy
+                         - dof: number of degrees of freedom (int)
+        grad_V_device: A Numba CUDA *device function* that computes the gradient
+                       of the potential energy V with respect to position q.
+                       Must have signature: `grad_V_device(q, dV_out, params_V, dof)`,
+                       where:
+                         - q: current position vector (1D Numba array, size dof)
+                         - dV_out: output array to store dV/dq (1D Numba array, size dof)
+                         - params_V: tuple of parameters for potential energy
+                         - dof: number of degrees of freedom (int)
+        dof: The number of degrees of freedom (int). This determines the dimension
+             of the phase space (2*dof total variables: dof positions + dof momenta).
+        solution: Which set of Yoshida coefficients to use. Must be one of:
+                  - "A": Standard 6th-order coefficients (default)
+                  - "B": Alternative coefficient set
+                  - "C": Alternative coefficient set
+                  Case-insensitive.
+
+    Returns:
+        A Numba CUDA kernel function specialized for the given gradient functions
+        and dof. The kernel has the signature:
+        `kernel(Y0, t0, dt, params_T, params_V, Y_out, steps)`
+          - Y0: GPU array of initial conditions (num_ics, 2*dof), where each row
+                is [q_0, q_1, ..., q_{dof-1}, p_0, p_1, ..., p_{dof-1}].
+          - t0: Initial time (float). Not used in the integration (autonomous
+                Hamiltonian), but kept for API compatibility.
+          - dt: Fixed time step (float).
+          - params_T: Tuple of parameters to pass to grad_T_device.
+          - params_V: Tuple of parameters to pass to grad_V_device.
+          - Y_out: GPU array to store final states (num_ics, 2*dof), same format
+                   as Y0.
+          - steps: Number of integration steps (int).
+
+    Raises:
+        ValueError: If solution is not one of {'A', 'B', 'C'}.
+    """
+
+    _DOF = dof
+    _NVAR = 2 * dof
+
+    sol = solution.upper()
+
+    if sol == "A":
+
+        w1, w2, w3 = (-1.17767998417887,  0.235573213359357,  0.784513610477560)
+
+    elif sol == "B":
+
+        w1, w2, w3 = (-2.13228522200144,  0.0426068187079180, 1.43984816797678)
+
+    elif sol == "C":
+
+        w1, w2, w3 = ( 0.0152886228424922, -2.14403531630539,  1.44778256239930)
+
+    else:
+
+        raise ValueError("solution must be one of {'A','B','C'}")
+
+    _w1, _w2, _w3 = float(w1), float(w2), float(w3)
+
+    @cuda.jit
+    def kernel(Y0, t0, dt, params_T, params_V, Y_out, steps):
+
+        """
+        CUDA kernel: Fixed-step Yoshida-6 symplectic integrator.
+        Each thread integrates one trajectory independently.
+
+        The integration uses a composition of drift and kick operations:
+        - Drift: q += dt * (dT/dp), updates position using kinetic energy gradient
+        - Kick:  p -= dt * (dV/dq), updates momentum using potential energy gradient
+
+        The 6th-order Yoshida method uses 8 kicks and 9 drifts per step, arranged
+        in a symmetric pattern to achieve 6th-order accuracy while preserving
+        symplecticity.
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        q   = cuda.local.array(_DOF, float64)
+        p   = cuda.local.array(_DOF, float64)
+        dT  = cuda.local.array(_DOF, float64)
+        dV  = cuda.local.array(_DOF, float64)
+
+        for i in range(_DOF):
+
+            q[i] = Y0[idx, i]
+            p[i] = Y0[idx, _DOF + i]
+
+        w1 = _w1
+        w2 = _w2
+        w3 = _w3
+        w0 = 1.0 - 2.0 * (w1 + w2 + w3)
+
+        d1 = w3; d2 = w2; d3 = w1; d4 = w0; d5 = w0; d6 = w1; d7 = w2; d8 = w3
+
+        c1 = 0.5 * w3
+        c2 = 0.5 * (w3 + w2)
+        c3 = 0.5 * (w2 + w1)
+        c4 = 0.5 * (w1 + w0)
+        c5 = w0      
+        c6 = c4 
+        c7 = c3
+        c8 = c2
+        c9 = c1
+
+        t = t0  
+
+        for _ in range(steps):
+
+            # ---- Drift 1 ----
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c1 * dt) * dT[i]
+
+            # ---- Kick 1 + Drift 2 ---
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d1 * dt) * dV[i]  # Kick: update momentum
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c2 * dt) * dT[i]  # Drift: update position
+
+            # ---- Kick 2 + Drift 3 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d2 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c3 * dt) * dT[i]
+
+            # ---- Kick 3 + Drift 4 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d3 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c4 * dt) * dT[i]
+
+            # ---- Kick 4 + Drift 5 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d4 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c5 * dt) * dT[i]
+
+            # ---- Kick 5 + Drift 6 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d5 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c6 * dt) * dT[i]
+
+            # ---- Kick 6 + Drift 7 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d6 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c7 * dt) * dT[i]
+
+            # ---- Kick 7 + Drift 8 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d7 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c8 * dt) * dT[i]
+
+            # ---- Kick 8 + Drift 9 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d8 * dt) * dV[i]
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c9 * dt) * dT[i]
+
+        for i in range(_DOF):
+
+            Y_out[idx, i]       = q[i]
+            Y_out[idx, _DOF+i]  = p[i]
+
+    return kernel
+
+# =========================================
+# Symplectic integrator kernel with LD calculation
+# =========================================
+def create_yoshida6_symplectic_kernel_LD(grad_T_device, grad_V_device, dof: int, solution: str = "A", ld_alpha: float = 1.0):
+    
+    """
+    Factory function that creates a Numba CUDA kernel for a fixed-step
+    6th-order Yoshida symplectic integrator with Lagrangian Descriptor (LD)
+    accumulation (for separable H = T(p) + V(q)).
+
+    This function extends the basic Yoshida integrator by computing Lagrangian
+    Descriptors, which are scalar quantities that characterize phase space
+    structures. The LD is computed as a Riemann sum approximation of the integral
+    of |dq/dt|^alpha + |dp/dt|^alpha over the trajectory, evaluated at the start
+    of each drift sub-stage and weighted by the corresponding time slice.
+
+    For separable Hamiltonians H(q,p) = T(p) + V(q):
+    - dq/dt = ∂T/∂p (velocity in position space)
+    - dp/dt = -∂V/∂q (force/acceleration in momentum space)
+
+    The LD accumulation reuses gradient evaluations already computed for the
+    integrator, making it computationally efficient.
+
+    Args:
+        grad_T_device: A Numba CUDA *device function* that computes the gradient
+                       of the kinetic energy T with respect to momentum p.
+                       Must have signature: `grad_T_device(p, dT_out, params_T, dof)`,
+                       where:
+                         - p: current momentum vector (1D Numba array, size dof)
+                         - dT_out: output array to store dT/dp (1D Numba array, size dof)
+                         - params_T: tuple of parameters for kinetic energy
+                         - dof: number of degrees of freedom (int)
+        grad_V_device: A Numba CUDA *device function* that computes the gradient
+                       of the potential energy V with respect to position q.
+                       Must have signature: `grad_V_device(q, dV_out, params_V, dof)`,
+                       where:
+                         - q: current position vector (1D Numba array, size dof)
+                         - dV_out: output array to store dV/dq (1D Numba array, size dof)
+                         - params_V: tuple of parameters for potential energy
+                         - dof: number of degrees of freedom (int)
+        dof: The number of degrees of freedom (int). This determines the dimension
+             of the phase space (2*dof total variables: dof positions + dof momenta).
+        solution: Which set of Yoshida coefficients to use. Must be one of:
+                  - "A": Standard 6th-order coefficients (default)
+                  - "B": Alternative coefficient set
+                  - "C": Alternative coefficient set
+                  Case-insensitive.
+        ld_alpha: The exponent alpha used in the LD integrand (float, default=1.0).
+                  The LD integrand is: sum_i (|dq_i/dt|^alpha + |dp_i/dt|^alpha).
+                  Common choices:
+                  - alpha=1.0: L1 norm (sum of absolute velocities)
+                  - alpha=0.5: Common choice in LD literature
+                  - alpha=2.0: L2 norm (Euclidean norm)
+
+    Returns:
+        A Numba CUDA kernel function specialized for the given gradient functions,
+        dof, and LD alpha parameter. The kernel has the signature:
+        `kernel(Y0, t0, dt, params_T, params_V, Y_out, LD_out, steps)`
+          - Y0: GPU array of initial conditions (num_ics, 2*dof), where each row
+                is [q_0, q_1, ..., q_{dof-1}, p_0, p_1, ..., p_{dof-1}].
+          - t0: Initial time (float). Not used in the integration (autonomous
+                Hamiltonian), but kept for API compatibility.
+          - dt: Fixed time step (float).
+          - params_T: Tuple of parameters to pass to grad_T_device.
+          - params_V: Tuple of parameters to pass to grad_V_device.
+          - Y_out: GPU array to store final states (num_ics, 2*dof), same format
+                   as Y0.
+          - LD_out: GPU array to store accumulated LD values (num_ics,), one per
+                    trajectory. The LD is accumulated over the full integration
+                    window (steps * dt total time).
+          - steps: Number of integration steps (int).
+
+    Raises:
+        ValueError: If solution is not one of {'A', 'B', 'C'}.
+    """
+
+    _DOF = dof
+    _NVAR = 2 * dof
+    _ALPHA = float(ld_alpha)
+
+    sol = solution.upper()
+
+    if sol == "A":
+
+        w1, w2, w3 = (-1.17767998417887,  0.235573213359357,  0.784513610477560)
+
+    elif sol == "B":
+
+        w1, w2, w3 = (-2.13228522200144,  0.0426068187079180, 1.43984816797678)
+
+    elif sol == "C":
+
+        w1, w2, w3 = ( 0.0152886228424922, -2.14403531630539,  1.44778256239930)
+
+    else:
+
+        raise ValueError("solution must be one of {'A','B','C'}")
+
+    _w1, _w2, _w3 = float(w1), float(w2), float(w3)
+
+    @cuda.jit
+    def kernel(Y0, t0, dt, params_T, params_V, Y_out, LD_out, steps):
+
+        """
+        CUDA kernel: Fixed-step Yoshida-6 symplectic integrator with LD accumulation.
+        Each thread integrates one trajectory independently.
+
+        The integration uses a composition of drift and kick operations:
+        - Drift: q += dt * (dT/dp), updates position using kinetic energy gradient
+        - Kick:  p -= dt * (dV/dq), updates momentum using potential energy gradient
+
+        The 6th-order Yoshida method uses 8 kicks and 9 drifts per step, arranged
+        in a symmetric pattern to achieve 6th-order accuracy while preserving
+        symplecticity.
+
+        The Lagrangian Descriptor is accumulated at the start of each drift sub-stage,
+        weighted by the corresponding time slice (c_k * dt), providing a consistent
+        Riemann-sum approximation that converges as dt -> 0.
+        """
+
+        idx = cuda.grid(1)
+
+        if idx >= Y0.shape[0]:
+
+            return
+
+        q   = cuda.local.array(_DOF, float64)
+        p   = cuda.local.array(_DOF, float64) 
+        dT  = cuda.local.array(_DOF, float64)
+        dV  = cuda.local.array(_DOF, float64)
+
+        for i in range(_DOF):
+
+            q[i] = Y0[idx, i]           
+            p[i] = Y0[idx, _DOF + i]     
+
+        w1 = _w1
+        w2 = _w2
+        w3 = _w3
+        w0 = 1.0 - 2.0 * (w1 + w2 + w3) 
+
+        d1 = w3; d2 = w2; d3 = w1; d4 = w0; d5 = w0; d6 = w1; d7 = w2; d8 = w3
+
+        c1 = 0.5 * w3
+        c2 = 0.5 * (w3 + w2)
+        c3 = 0.5 * (w2 + w1)
+        c4 = 0.5 * (w1 + w0)
+        c5 = w0           
+        c6 = c4  
+        c7 = c3
+        c8 = c2
+        c9 = c1
+
+        LD = 0.0
+
+        def accumulate_LD(c_factor):
+
+            """
+            Accumulates LD contribution from current state for a drift slice.
+
+            Computes the LD integrand: sum_i (|dq_i/dt|^alpha + |dp_i/dt|^alpha)
+            at the current state, where:
+            - dq_i/dt = (dT/dp)_i (velocity in position space)
+            - dp_i/dt = -(dV/dq)_i (force in momentum space)
+
+            The result is weighted by the time slice (c_factor * dt) to form
+            a Riemann sum approximation.
+
+            Args:
+                c_factor: The drift coefficient for this sub-stage (float).
+
+            Returns:
+                The LD contribution for this time slice (float).
+            """
+
+            grad_T_device(p, dT, params_T, _DOF) 
+            grad_V_device(q, dV, params_V, _DOF) 
+
+            acc = 0.0
+
+            for j in range(_DOF):
+
+                vq = dT[j]
+                vp = dV[j] 
+
+                if vq < 0.0:
+
+                    vq = -vq
+
+                if vp < 0.0:
+
+                    vp = -vp
+
+                acc += vq ** _ALPHA + vp ** _ALPHA
+
+            return acc * (c_factor * dt)
+
+        for _ in range(steps):
+
+            LD += accumulate_LD(c1)
+
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c1 * dt) * dT[i]
+
+            # ---- Kick 1 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d1 * dt) * dV[i]
+
+            # ---- Drift 2 ----
+            LD += accumulate_LD(c2)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c2 * dt) * dT[i]
+
+            # ---- Kick 2 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d2 * dt) * dV[i]
+
+            # ---- Drift 3 ----
+            LD += accumulate_LD(c3)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c3 * dt) * dT[i]
+
+            # ---- Kick 3 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d3 * dt) * dV[i]
+
+            # ---- Drift 4 ----
+            LD += accumulate_LD(c4)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c4 * dt) * dT[i]
+
+            # ---- Kick 4 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d4 * dt) * dV[i]
+
+            # ---- Drift 5 ----
+            LD += accumulate_LD(c5)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c5 * dt) * dT[i]
+
+            # ---- Kick 5 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d5 * dt) * dV[i]
+
+            # ---- Drift 6 ----
+            LD += accumulate_LD(c6)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c6 * dt) * dT[i]
+
+            # ---- Kick 6 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d6 * dt) * dV[i]
+
+            # ---- Drift 7 ----
+            LD += accumulate_LD(c7)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c7 * dt) * dT[i]
+
+            # ---- Kick 7 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d7 * dt) * dV[i]
+
+            # ---- Drift 8 ----
+            LD += accumulate_LD(c8)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c8 * dt) * dT[i]
+
+            # ---- Kick 8 ----
+            grad_V_device(q, dV, params_V, _DOF)
+            for i in range(_DOF):
+                p[i] -= (d8 * dt) * dV[i]
+
+            # ---- Drift 9 ----
+            LD += accumulate_LD(c9)
+            grad_T_device(p, dT, params_T, _DOF)
+            for i in range(_DOF):
+                q[i] += (c9 * dt) * dT[i]
+
+        for i in range(_DOF):
+
+            Y_out[idx, i]       = q[i]
+            Y_out[idx, _DOF+i]  = p[i]
+
+        LD_out[idx] = LD
+
+    return kernel
